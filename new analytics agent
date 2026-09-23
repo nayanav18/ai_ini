@@ -1,0 +1,1055 @@
+"""
+analytics_agent.py — Intent-aware Phase 2 Analytics Agent.
+
+Responsibilities:
+- Produce factual analytics answers from BigQuery results.
+- Respect the application-level intent routed by IntentRouter.
+- Keep conversation separate from analytics.
+- Handle analysis, comparison, visualization, and dashboard intents.
+- Do not automatically create a chart for ordinary analysis.
+- Preserve the existing analytics response structure expected by the frontend.
+- Validate generated numbers against retrieved data.
+"""
+
+import json
+import structlog
+import vertexai
+
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+from services.persona_service import get_persona_prompt_injection
+from services.chart_selector import (
+    select_chart_type,
+    rows_to_chart_data,
+    get_chart_description,
+)
+from services.guardrail_service import (
+    strip_pii,
+    validate_numbers_against_data,
+)
+from config import settings
+
+logger = structlog.get_logger()
+
+
+ANALYTICS_SYSTEM = """
+You are the analytics reasoning engine for Vodafone Ireland.
+
+Your job is to answer the user's analytics request using ONLY the
+BigQuery data supplied in the prompt.
+
+CRITICAL RULES:
+
+1. Never invent numbers.
+2. Never claim a number that is not supported by the supplied data.
+3. Answer the user's actual question directly.
+4. Preserve the distinction between:
+   - analysis
+   - comparison
+   - visualization
+   - dashboard
+5. Ordinary analysis MUST NOT automatically require a chart.
+6. A chart should only be produced when the routed intent is:
+   - visualization
+   or when the user explicitly requested a chart/graph/plot.
+7. Comparison requests must explicitly compare the requested periods,
+   dimensions, or entities using the supplied data.
+8. If the supplied data is insufficient to answer the question,
+   clearly state that instead of inventing an answer.
+9. Use the exact metric and dimension names present in the data where
+   appropriate.
+10. Return ONLY valid JSON.
+11. KPI values and changes must be strings.
+12. Do not fabricate competitor statistics or market statistics.
+13. Do not treat a missing value as zero.
+14. Follow the conversation history when interpreting follow-up queries.
+"""
+
+
+ANALYTICS_PROMPT = """
+{persona_context}
+
+ROUTED APPLICATION INTENT:
+{intent}
+
+USER QUERY:
+{query}
+
+CONVERSATION HISTORY:
+{history_context}
+
+BIGQUERY SCHEMA:
+{schema}
+
+QUERY RESULTS:
+
+CURRENT PERIOD:
+{current_data}
+
+PREVIOUS PERIOD:
+{previous_data}
+
+BY DIMENSIONS:
+{dimensions_data}
+
+TREND:
+{trend_data}
+
+MARKET CONTEXT:
+{market_context}
+
+CHART INSTRUCTIONS:
+{chart_instructions}
+
+Generate the response required by the user's routed intent.
+
+Return ONLY this JSON:
+
+{{
+  "what_happened": "Direct answer to the user's question in 1-3 sentences.",
+
+  "kpis": [
+    {{
+      "label": "...",
+      "value": "...",
+      "change": "...",
+      "trend": "up|down|neutral"
+    }}
+  ],
+
+  "chart": {{
+    "type": "{chart_type}",
+    "title": "...",
+    "auto_selected": {chart_auto_selected},
+    "selection_reason": "{chart_reason}",
+    "data": []
+  }},
+
+  "root_causes": [
+    {{
+      "driver": "...",
+      "detail": "...",
+      "impact_pct": "...",
+      "confidence_pct": "..."
+    }}
+  ],
+
+  "market_analysis": [
+    {{
+      "type": "Market",
+      "icon": "🌍",
+      "text": "..."
+    }}
+  ],
+
+  "competitor_analysis": [
+    {{
+      "operator": "...",
+      "threat_level": "High|Medium|Low",
+      "detail": "...",
+      "market_share": "..."
+    }}
+  ],
+
+  "recommendations": [
+    {{
+      "priority": "P1|P2",
+      "action": "...",
+      "type": "Tactical|Strategic",
+      "timeline": "...",
+      "expected_impact": "..."
+    }}
+  ],
+
+  "risks": [
+    {{
+      "severity": "High|Medium|Low",
+      "risk": "...",
+      "mitigation": "..."
+    }}
+  ],
+
+  "summary_bullets": [
+    "...",
+    "...",
+    "..."
+  ],
+
+  "suggested_questions": [
+    "...",
+    "...",
+    "...",
+    "...",
+    "..."
+  ]
+}}
+
+INTENT-SPECIFIC RULES:
+
+ANALYSIS:
+- Answer the actual analytical question.
+- Do not force a comparison unless requested.
+- Do not automatically create a chart.
+- The chart should normally contain an empty data array.
+
+COMPARISON:
+- Explicitly identify the two or more things being compared.
+- Use the current and previous period data when those represent
+  the requested comparison.
+- Explain the numerical difference where possible.
+- Do not describe a comparison as a trend unless the data supports it.
+
+VISUALIZATION:
+- Prepare the requested visualization.
+- The chart must contain the actual supplied chart data.
+- Use the requested or selected chart type.
+- Do not replace the data with invented values.
+
+DASHBOARD:
+- Treat this as a dashboard-oriented request.
+- Return useful dashboard-level KPIs/data from the supplied results.
+- Do not invent a fixed dashboard.
+- If the request asks to create/show a dashboard rather than answer
+  a metric question, preserve that intent in the response.
+
+If the data does not support part of the requested response,
+leave that section empty rather than inventing content.
+
+Persona:
+{persona_name}
+"""
+
+
+FALLBACK_PROMPT = """
+You are an analytics AI for Vodafone Ireland.
+
+The analytics pipeline could not produce a valid result.
+
+User query:
+"{query}"
+
+Application intent:
+{intent}
+
+Persona:
+{persona_name}
+
+Generate a concise, useful response explaining that the requested
+data could not be retrieved or interpreted.
+
+Do not invent any analytics numbers.
+
+Return ONLY valid JSON:
+
+{{
+  "what_happened": "...",
+  "kpis": [],
+  "chart": {{
+    "type": "bar",
+    "title": "No data available",
+    "data": [],
+    "auto_selected": false,
+    "selection_reason": "No usable data"
+  }},
+  "root_causes": [],
+  "market_analysis": [],
+  "competitor_analysis": [],
+  "recommendations": [],
+  "risks": [],
+  "summary_bullets": [],
+  "suggested_questions": []
+}}
+"""
+
+
+QUESTIONS_PROMPT = """
+You are an analytics AI for Vodafone Ireland.
+
+Generate exactly 5 useful follow-up questions for a {persona_name}
+persona based on this request:
+
+"{query}"
+
+Application intent:
+{intent}
+
+Available data dimensions and values:
+{dimensions}
+
+Questions must be grounded in the available dimensions and must not
+invent unavailable values.
+
+Return ONLY a JSON array of 5 strings.
+"""
+
+
+PERSONA_FALLBACK_PROMPT = """
+Generate a concise persona context injection for:
+
+persona_id="{persona_id}"
+
+Return plain text describing:
+- role
+- analytics focus
+- useful KPIs
+- preferred question style
+
+Do not invent company-specific numerical facts.
+"""
+
+
+class AnalyticsAgent:
+
+    def __init__(self):
+        self._model = None
+
+    def _get_model(self) -> GenerativeModel:
+        if not self._model:
+            vertexai.init(
+                project=settings.GCP_PROJECT_ID,
+                location=settings.GCP_LOCATION,
+            )
+
+            self._model = GenerativeModel(
+                model_name=settings.VERTEX_AI_MODEL
+            )
+
+        return self._model
+
+    async def _generate(
+        self,
+        prompt: str,
+        max_tokens: int = 1000,
+        temperature: float = 0.3,
+    ) -> str:
+        """Single reusable Gemini call."""
+
+        model = self._get_model()
+
+        response = await model.generate_content_async(
+            prompt,
+            generation_config=GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            ),
+        )
+
+        return response.text.strip()
+
+    async def _ai_persona_context(
+        self,
+        persona_id: str,
+    ) -> str:
+        """Generate persona context if persona service is unavailable."""
+
+        try:
+            return await self._generate(
+                PERSONA_FALLBACK_PROMPT.format(
+                    persona_id=persona_id
+                ),
+                max_tokens=400,
+            )
+
+        except Exception as e:
+            logger.warning(
+                "AI persona generation failed",
+                error=str(e),
+            )
+
+            return (
+                f"USER PERSONA: {persona_id.title()}\n"
+                "Role: Analytics user."
+            )
+
+    async def _ai_suggested_questions(
+        self,
+        query: str,
+        intent: str,
+        persona_name: str,
+        dim_rows: list,
+    ) -> list:
+        """Generate grounded follow-up questions."""
+
+        try:
+            dims = (
+                json.dumps(
+                    dim_rows[:10],
+                    default=str,
+                )
+                if dim_rows
+                else "[]"
+            )
+
+            raw = await self._generate(
+                QUESTIONS_PROMPT.format(
+                    persona_name=persona_name,
+                    query=query,
+                    intent=intent,
+                    dimensions=dims,
+                ),
+                max_tokens=400,
+            )
+
+            raw = (
+                raw.replace("```json", "")
+                .replace("```", "")
+                .strip()
+            )
+
+            questions = json.loads(raw)
+
+            if isinstance(questions, list):
+                return [
+                    str(question)
+                    for question in questions[:5]
+                ]
+
+        except Exception as e:
+            logger.warning(
+                "AI questions generation failed",
+                error=str(e),
+            )
+
+        return []
+
+    async def _ai_fallback_result(
+        self,
+        query: str,
+        intent: str,
+        persona_name: str,
+    ) -> dict:
+        """Generate a safe fallback response."""
+
+        try:
+            raw = await self._generate(
+                FALLBACK_PROMPT.format(
+                    query=query,
+                    intent=intent,
+                    persona_name=persona_name,
+                ),
+                max_tokens=800,
+            )
+
+            raw = (
+                raw.replace("```json", "")
+                .replace("```", "")
+                .strip()
+            )
+
+            result = json.loads(raw)
+
+            if isinstance(result, dict):
+                return result
+
+        except Exception as e:
+            logger.error(
+                "AI fallback generation failed",
+                error=str(e),
+            )
+
+        return {
+            "what_happened": (
+                "The requested analytics data could not be "
+                "retrieved or interpreted."
+            ),
+            "kpis": [],
+            "chart": {
+                "type": "bar",
+                "title": "No data available",
+                "data": [],
+                "auto_selected": False,
+                "selection_reason": "No usable data",
+            },
+            "root_causes": [],
+            "market_analysis": [],
+            "competitor_analysis": [],
+            "recommendations": [],
+            "risks": [],
+            "summary_bullets": [],
+            "suggested_questions": [],
+        }
+
+    def _get_chart_instructions(
+        self,
+        intent: str,
+        query: str,
+    ) -> str:
+        """
+        Decide whether Analytics should produce chart data.
+
+        This is intentionally deterministic.
+        Gemini should not decide whether ordinary analysis becomes
+        a visualization.
+        """
+
+        if intent == "visualization":
+            return (
+                "The user explicitly requested a visualization. "
+                "Generate chart data using the supplied chart rows."
+            )
+
+        if intent == "comparison":
+            return (
+                "This is a comparison request. "
+                "Do not automatically create a chart unless the "
+                "user explicitly requested one."
+            )
+
+        if intent == "dashboard":
+            return (
+                "This is a dashboard request. "
+                "Provide dashboard-relevant data, but do not invent "
+                "a dashboard layout."
+            )
+
+        return (
+            "This is ordinary analysis. "
+            "Do NOT automatically generate chart data. "
+            "Answer the analytical question directly."
+        )
+
+    def _should_render_chart(
+        self,
+        intent: str,
+        query: str,
+    ) -> bool:
+        """Return True only when visualization was requested."""
+
+        if intent == "visualization":
+            return True
+
+        query_lower = query.lower()
+
+        visualization_terms = (
+            "chart",
+            "graph",
+            "plot",
+            "visualize",
+            "visualise",
+            "bar chart",
+            "line chart",
+            "pie chart",
+            "show this as",
+            "display this as",
+        )
+
+        return any(
+            term in query_lower
+            for term in visualization_terms
+        )
+
+    async def run(self, context: dict) -> dict:
+        """
+        Run intent-aware analytics.
+
+        Expected pipeline:
+
+        Intent Router
+            ↓
+        Planner
+            ↓
+        Metadata
+            ↓
+        Data
+            ↓
+        Analytics
+        """
+
+        query = context.get("query", "") or ""
+
+        intent = (
+            context.get("intent", "analysis")
+            or "analysis"
+        ).lower()
+
+        schema = (
+            context.get("schema_text", "")
+            or ""
+        )
+
+        current_rows = (
+            context.get("current_data")
+            or []
+        )
+
+        previous_rows = (
+            context.get("previous_data")
+            or []
+        )
+
+        dimension_rows = (
+            context.get("dimensions_data")
+            or []
+        )
+
+        trend_rows = (
+            context.get("trend_data")
+            or []
+        )
+
+        chart_rows = (
+            context.get("chart_data")
+            or []
+        )
+
+        market_context = (
+            context.get("market_context", "")
+            or ""
+        )
+
+        persona_id = (
+            context.get("persona_id", "analyst")
+            or "analyst"
+        )
+
+        persona_name = (
+            context.get("persona_name", "Analyst")
+            or "Analyst"
+        )
+
+        history_context = (
+            context.get("history_context", "")
+            or ""
+        )
+
+        logger.info(
+            "Analytics agent started",
+            intent=intent,
+            persona=persona_id,
+            query=query[:150],
+        )
+
+        # ---------------------------------------------------------
+        # Safety: conversation should never be analytically processed.
+        # ---------------------------------------------------------
+
+        if intent == "conversation":
+            logger.warning(
+                "Conversation reached AnalyticsAgent unexpectedly"
+            )
+
+            context["analytics_result"] = {
+                "what_happened": "",
+                "kpis": [],
+                "chart": {
+                    "type": "bar",
+                    "title": "",
+                    "data": [],
+                    "auto_selected": False,
+                    "selection_reason": "",
+                },
+                "root_causes": [],
+                "market_analysis": [],
+                "competitor_analysis": [],
+                "recommendations": [],
+                "risks": [],
+                "summary_bullets": [],
+                "suggested_questions": [],
+            }
+
+            return context
+
+        # ---------------------------------------------------------
+        # Persona context
+        # ---------------------------------------------------------
+
+        try:
+            persona_context = get_persona_prompt_injection(
+                persona_id
+            )
+
+            if not persona_context:
+                persona_context = (
+                    await self._ai_persona_context(
+                        persona_id
+                    )
+                )
+
+        except Exception as e:
+            logger.warning(
+                "Persona service failed",
+                error=str(e),
+            )
+
+            persona_context = (
+                await self._ai_persona_context(
+                    persona_id
+                )
+            )
+
+        # ---------------------------------------------------------
+        # Chart decision
+        # ---------------------------------------------------------
+
+        should_render_chart = self._should_render_chart(
+            intent,
+            query,
+        )
+
+        chart_type = "none"
+        chart_reason = "Visualization was not requested."
+
+        if should_render_chart:
+
+            try:
+                chart_type = select_chart_type(
+                    query=query,
+                    rows=chart_rows,
+                    requested_type=(
+                        "kpi_card"
+                        if (
+                            context.get(
+                                "metric_semantics"
+                            ) == "snapshot"
+                            and len(chart_rows) <= 1
+                        )
+                        else None
+                    ),
+                )
+
+                chart_reason = get_chart_description(
+                    chart_type
+                )
+
+            except Exception as e:
+                logger.warning(
+                    "Chart selection failed",
+                    error=str(e),
+                )
+
+                chart_type = "bar"
+                chart_reason = (
+                    "Fallback visualization type"
+                )
+
+        chart_instructions = (
+            self._get_chart_instructions(
+                intent,
+                query,
+            )
+        )
+
+        # ---------------------------------------------------------
+        # Limit data passed into prompt.
+        # ---------------------------------------------------------
+
+        current_data = json.dumps(
+            current_rows,
+            default=str,
+        )[:1200]
+
+        previous_data = json.dumps(
+            previous_rows,
+            default=str,
+        )[:1000]
+
+        dimensions_data = json.dumps(
+            dimension_rows,
+            default=str,
+        )[:1200]
+
+        trend_data = json.dumps(
+            trend_rows,
+            default=str,
+        )[:1000]
+
+        # ---------------------------------------------------------
+        # Build intent-aware analytics prompt.
+        # ---------------------------------------------------------
+
+        prompt = ANALYTICS_PROMPT.format(
+            persona_context=persona_context,
+            intent=intent,
+            query=query,
+            history_context=(
+                history_context
+                if history_context
+                else "No previous conversation context."
+            ),
+            schema=schema[:1800],
+            current_data=current_data,
+            previous_data=previous_data,
+            dimensions_data=dimensions_data,
+            trend_data=trend_data,
+            market_context=market_context[:800],
+            chart_instructions=chart_instructions,
+            chart_type=chart_type,
+            chart_auto_selected=(
+                "true"
+                if should_render_chart
+                else "false"
+            ),
+            chart_reason=chart_reason,
+            persona_name=persona_name,
+        )
+
+        full_prompt = (
+            f"{ANALYTICS_SYSTEM}\n\n"
+            f"{prompt}"
+        )
+
+        try:
+            raw = await self._generate(
+                full_prompt,
+                max_tokens=3000,
+                temperature=0.2,
+            )
+
+            # Remove accidental markdown fences.
+            if raw.startswith("```"):
+                raw = raw.split(
+                    "\n",
+                    1,
+                )[-1].rsplit(
+                    "```",
+                    1,
+                )[0].strip()
+
+            result = json.loads(raw)
+
+            if not isinstance(result, dict):
+                raise ValueError(
+                    "Analytics result is not a JSON object"
+                )
+
+            # -----------------------------------------------------
+            # Chart post-processing
+            # -----------------------------------------------------
+
+            if not should_render_chart:
+                result["chart"] = {
+                    "type": "none",
+                    "title": "",
+                    "auto_selected": False,
+                    "selection_reason": (
+                        "No visualization was requested."
+                    ),
+                    "data": [],
+                }
+
+            else:
+                chart = result.get("chart")
+
+                if not isinstance(chart, dict):
+                    chart = {}
+
+                chart["type"] = chart_type
+                chart["auto_selected"] = True
+                chart["selection_reason"] = chart_reason
+
+                if chart_rows:
+                    try:
+                        chart["data"] = rows_to_chart_data(
+                            chart_rows,
+                            chart_type,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Chart data formatting failed",
+                            error=str(e),
+                        )
+                        chart["data"] = []
+
+                else:
+                    chart["data"] = []
+
+                result["chart"] = chart
+
+            # -----------------------------------------------------
+            # Number validation
+            # -----------------------------------------------------
+
+            try:
+                all_rows = (
+                    list(current_rows)
+                    + list(previous_rows)
+                    + list(dimension_rows)
+                    + list(trend_rows)
+                )
+
+                validated = validate_numbers_against_data(
+                    result,
+                    all_rows,
+                )
+
+                if isinstance(validated, dict):
+                    result = validated
+
+            except Exception as e:
+                logger.warning(
+                    "Number validation failed",
+                    error=str(e),
+                )
+
+            # -----------------------------------------------------
+            # Canonical snapshot KPI
+            # -----------------------------------------------------
+
+            if (
+                context.get("metric_semantics")
+                == "snapshot"
+                and current_rows
+            ):
+                try:
+                    first_row = current_rows[0]
+
+                    value = next(
+                        iter(first_row.values())
+                    )
+
+                    if value is not None:
+
+                        numeric_value = float(value)
+
+                        existing_kpis = (
+                            result.get("kpis")
+                            or []
+                        )
+
+                        first_kpi = (
+                            existing_kpis[0]
+                            if existing_kpis
+                            else {}
+                        )
+
+                        result["kpis"] = [
+                            {
+                                "label": (
+                                    first_kpi.get(
+                                        "label"
+                                    )
+                                    or "Metric"
+                                ),
+                                "value": (
+                                    f"{numeric_value:,.0f}"
+                                ),
+                                "change": str(
+                                    first_kpi.get(
+                                        "change",
+                                        "N/A",
+                                    )
+                                ),
+                                "trend": (
+                                    first_kpi.get(
+                                        "trend",
+                                        "neutral",
+                                    )
+                                ),
+                            },
+                            *existing_kpis[1:3],
+                        ]
+
+                except (
+                    TypeError,
+                    ValueError,
+                    StopIteration,
+                ) as e:
+                    logger.warning(
+                        "Canonical snapshot KPI formatting failed",
+                        error=str(e),
+                    )
+
+            # -----------------------------------------------------
+            # PII stripping
+            # -----------------------------------------------------
+
+            cleaned_bullets = []
+
+            for bullet in (
+                result.get("summary_bullets")
+                or []
+            ):
+                try:
+                    cleaned_bullets.append(
+                        strip_pii(bullet)
+                        if bullet
+                        else bullet
+                    )
+                except Exception:
+                    cleaned_bullets.append(bullet)
+
+            result["summary_bullets"] = (
+                cleaned_bullets
+            )
+
+            # -----------------------------------------------------
+            # Suggested questions
+            # -----------------------------------------------------
+
+            questions = (
+                result.get("suggested_questions")
+                or []
+            )
+
+            if len(questions) < 5:
+                ai_questions = (
+                    await self._ai_suggested_questions(
+                        query=query,
+                        intent=intent,
+                        persona_name=persona_name,
+                        dim_rows=dimension_rows,
+                    )
+                )
+
+                questions = (
+                    questions + ai_questions
+                )[:5]
+
+                result["suggested_questions"] = (
+                    questions
+                )
+
+            # -----------------------------------------------------
+            # Explicit intent metadata
+            # -----------------------------------------------------
+
+            result["intent"] = intent
+
+            logger.info(
+                "Analytics complete",
+                intent=intent,
+                persona=persona_id,
+                chart_type=chart_type,
+                chart_requested=should_render_chart,
+                kpis=len(
+                    result.get("kpis") or []
+                ),
+            )
+
+            context["analytics_result"] = result
+
+            return context
+
+        except json.JSONDecodeError as e:
+
+            logger.error(
+                "Analytics JSON parse failed",
+                error=str(e)[:120],
+            )
+
+            context["analytics_result"] = (
+                await self._ai_fallback_result(
+                    query=query,
+                    intent=intent,
+                    persona_name=persona_name,
+                )
+            )
+
+            return context
+
+        except Exception as e:
+
+            logger.error(
+                "AnalyticsAgent failed",
+                error=str(e)[:200],
+            )
+
+            context["analytics_result"] = (
+                await self._ai_fallback_result(
+                    query=query,
+                    intent=intent,
+                    persona_name=persona_name,
+                )
+            )
+
+            return context
