@@ -1,0 +1,71 @@
+steps:
+  # ── Backend ────────────────────────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-backend
+    args:
+      - build
+      - "-t"
+      - "gcr.io/$PROJECT_ID/analytics-backend:$COMMIT_SHA"
+      - "-t"
+      - "gcr.io/$PROJECT_ID/analytics-backend:latest"
+      - "./backend"
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-backend
+    args: ["push", "gcr.io/$PROJECT_ID/analytics-backend:$COMMIT_SHA"]
+    waitFor: ["build-backend"]
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: deploy-backend
+    args:
+      - run
+      - deploy
+      - analytics-backend
+      - "--image=gcr.io/$PROJECT_ID/analytics-backend:$COMMIT_SHA"
+      - "--region=us-central1"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--memory=2Gi"
+      - "--cpu=2"
+      - "--min-instances=1"
+      - "--max-instances=10"
+      - "--set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,GCP_LOCATION=us-central1,ENVIRONMENT=production"
+      - "--set-secrets=SECRET_KEY=analytics-secret-key:latest"
+    waitFor: ["push-backend"]
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-frontend
+    args:
+      - build
+      - "-t"
+      - "gcr.io/$PROJECT_ID/analytics-frontend:$COMMIT_SHA"
+      - "--build-arg"
+      - "VITE_API_URL=https://analytics-backend-$_BACKEND_HASH-uc.a.run.app"
+      - "./frontend"
+    waitFor: ["deploy-backend"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-frontend
+    args: ["push", "gcr.io/$PROJECT_ID/analytics-frontend:$COMMIT_SHA"]
+    waitFor: ["build-frontend"]
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: deploy-frontend
+    args:
+      - run
+      - deploy
+      - analytics-frontend
+      - "--image=gcr.io/$PROJECT_ID/analytics-frontend:$COMMIT_SHA"
+      - "--region=us-central1"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--memory=512Mi"
+      - "--cpu=1"
+    waitFor: ["push-frontend"]
+
+substitutions:
+  _BACKEND_HASH: "placeholder"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

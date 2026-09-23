@@ -1,0 +1,285 @@
+personas:
+  - id: ceo
+    name: "CEO / Executive"
+    icon: "👔"
+    tagline: "Revenue, market leadership and strategic position"
+    focus:
+      - total_subscribers
+      - revenue
+      - market_share
+      - arpu
+      - competitive_position
+    default_kpis:
+      - label: "Total Subscribers"
+        column_hint: "Subscriber_Count_CM"
+        format: "number"
+        goal: "maximize"
+      - label: "ARPU"
+        column_hint: "revenue"
+        format: "currency_eur"
+        goal: "maximize"
+      - label: "Market Share"
+        column_hint: "market_share"
+        format: "percent"
+        goal: "maximize"
+      - label: "Net Movement"
+        column_hint: "inflow_outflow"
+        format: "number_signed"
+        goal: "maximize"
+    dashboard_layers:
+      - id: "executive_overview"
+        label: "Executive Overview"
+        icon: "📊"
+        charts:
+          - type: "line"
+            title: "Subscriber Trend"
+            query_type: "trend"
+            metric: "Subscriber_Count_CM"
+          - type: "donut"
+            title: "Channel Mix"
+            query_type: "by_dimensions"
+            dimension: "Channel"
+          - type: "waterfall"
+            title: "INFLOW vs OUTFLOW"
+            query_type: "current_period"
+            metric: "transaction_type"
+          - type: "bar"
+            title: "Revenue by Segment"
+            query_type: "by_dimensions"
+            dimension: "Customer_Subscriber_Type_Description_Q"
+    story_prompt: "Focus on strategic performance: market share vs Eir and Three Ireland, subscriber growth trajectory, revenue and ARPU trends, and competitive threats to Vodafone Ireland market leadership."
+    question_style: "strategic"
+    suggested_questions:
+      - "Show Vodafone Ireland subscriber trend vs market for 2026"
+      - "What drove revenue growth or decline in May 2026?"
+      - "How does Vodafone Ireland ARPU compare to Eir and Three Ireland?"
+      - "What is our market share trajectory for Q2 2026?"
+      - "Show competitive position: subscribers, share and ARPU vs all competitors"
+
+  - id: marketing
+    name: "Marketing Director"
+    icon: "📢"
+    tagline: "Acquisition, channel ROI and campaign performance"
+    focus:
+      - inflow_transactions
+      - channel_performance
+      - acquisition_cost
+      - plan_performance
+      - segment_growth
+    default_kpis:
+      - label: "Gross INFLOW"
+        column_hint: "INFLOW"
+        format: "number"
+        goal: "maximize"
+      - label: "Top Channel"
+        column_hint: "Channel"
+        format: "text"
+        goal: "track"
+      - label: "Best Plan"
+        column_hint: "Price_Plan"
+        format: "text"
+        goal: "track"
+      - label: "Net New Subscribers"
+        column_hint: "net_movement"
+        format: "number_signed"
+        goal: "maximize"
+    dashboard_layers:
+      - id: "channel_performance"
+        label: "Channel Performance"
+        icon: "📡"
+        charts:
+          - type: "bar"
+            title: "INFLOW by Channel"
+            query_type: "by_dimensions"
+            dimension: "Channel"
+          - type: "stacked_bar"
+            title: "Channel Mix Over Time"
+            query_type: "trend"
+            dimension: "Channel"
+          - type: "donut"
+            title: "Plan Type Mix"
+            query_type: "by_dimensions"
+            dimension: "Price_Plan"
+          - type: "funnel"
+            title: "Acquisition Funnel"
+            query_type: "by_dimensions"
+            dimension: "transaction_type"
+    story_prompt: "Focus on acquisition: which channels are driving INFLOW growth, which product plans are best performing, what is the subscriber mix by type, and what channel strategy should be amplified."
+    question_style: "tactical"
+    suggested_questions:
+      - "Which channel drove the most INFLOW in May 2026 — show as bar chart?"
+      - "What is the top performing product plan by subscriber count?"
+      - "Show channel contribution to INFLOW trend over 6 months"
+      - "Which customer segment is growing fastest by acquisition channel?"
+      - "Show INFLOW vs OUTFLOW by channel for May 2026 — waterfall chart"
+
+  - id: product
+    name: "Product Manager"
+    icon: "📦"
+    tagline: "Plan performance, ARPU and bundle adoption"
+    focus:
+      - plan_performance
+      - arpu_by_plan
+      - bundle_adoption
+      - upgrade_rate
+      - product_mix
+    default_kpis:
+      - label: "Top Plan Subscribers"
+        column_hint: "Price_Plan"
+        format: "number"
+        goal: "maximize"
+      - label: "Postpay Mix"
+        column_hint: "postpay_share"
+        format: "percent"
+        goal: "maximize"
+      - label: "Bundle Adoption"
+        column_hint: "convergence"
+        format: "percent"
+        goal: "maximize"
+      - label: "Plan Churn"
+        column_hint: "OUTFLOW_plan"
+        format: "number"
+        goal: "minimize"
+    dashboard_layers:
+      - id: "plan_performance"
+        label: "Plan Performance"
+        icon: "📦"
+        charts:
+          - type: "bar"
+            title: "Subscribers by Plan"
+            query_type: "by_dimensions"
+            dimension: "Price_Plan"
+          - type: "donut"
+            title: "Postpay vs Prepay"
+            query_type: "by_dimensions"
+            dimension: "subscriber_type"
+          - type: "waterfall"
+            title: "Plan Inflow/Outflow"
+            query_type: "by_dimensions"
+            dimension: "transaction_type_plan"
+          - type: "line"
+            title: "Plan Growth Trend"
+            query_type: "trend"
+            dimension: "Price_Plan"
+    story_prompt: "Focus on product mix: which plans are growing and declining, postpay vs prepay balance, convergence and bundle adoption, and plan-level churn signals."
+    question_style: "analytical"
+    suggested_questions:
+      - "Which product plans have the highest subscriber count — bar chart?"
+      - "What is the postpay vs prepay split and trend for 2026?"
+      - "Show INFLOW and OUTFLOW by product plan — waterfall chart"
+      - "Which plans have the highest churn rate in May 2026?"
+      - "Show top 5 plans by INFLOW growth over 6 months"
+
+  - id: operations
+    name: "Operations Manager"
+    icon: "⚙️"
+    tagline: "Churn, retention and service quality"
+    focus:
+      - churn_rate
+      - outflow_reasons
+      - retention_rate
+      - service_quality
+      - at_risk_segments
+    default_kpis:
+      - label: "Gross OUTFLOW"
+        column_hint: "OUTFLOW"
+        format: "number"
+        goal: "minimize"
+      - label: "Churn Rate"
+        column_hint: "churn_rate"
+        format: "percent"
+        goal: "minimize"
+      - label: "Retention Rate"
+        column_hint: "retention"
+        format: "percent"
+        goal: "maximize"
+      - label: "At-Risk Subscribers"
+        column_hint: "at_risk"
+        format: "number"
+        goal: "minimize"
+    dashboard_layers:
+      - id: "churn_analysis"
+        label: "Churn Analysis"
+        icon: "📉"
+        charts:
+          - type: "line"
+            title: "OUTFLOW Trend"
+            query_type: "trend"
+            metric: "OUTFLOW"
+          - type: "bar"
+            title: "OUTFLOW by Segment"
+            query_type: "by_dimensions"
+            dimension: "Customer_Subscriber_Type_Description_Q"
+          - type: "donut"
+            title: "Churn by Channel"
+            query_type: "by_dimensions"
+            dimension: "Channel_OUTFLOW"
+          - type: "waterfall"
+            title: "Retention vs Churn Bridge"
+            query_type: "current_period"
+            metric: "retention_bridge"
+    story_prompt: "Focus on retention and churn: which segments and plans have the highest OUTFLOW, what is the churn trend over 6 months, which channels lose the most subscribers, and what retention actions are most urgent."
+    question_style: "operational"
+    suggested_questions:
+      - "Show OUTFLOW trend by month for the last 6 months — line chart"
+      - "Which customer segment has the highest churn rate in May 2026?"
+      - "What product plans have the most OUTFLOW — bar chart?"
+      - "Show INFLOW vs OUTFLOW balance by channel — waterfall"
+      - "Which plans are losing subscribers fastest — trend chart?"
+
+  - id: analyst
+    name: "Data Analyst"
+    icon: "🔍"
+    tagline: "Deep dimensional analysis, trends and anomalies"
+    focus:
+      - all_metrics
+      - dimensional_breakdown
+      - trend_analysis
+      - anomaly_detection
+      - cross_segment_correlation
+    default_kpis:
+      - label: "Total Records"
+        column_hint: "row_count"
+        format: "number"
+        goal: "track"
+      - label: "Date Range"
+        column_hint: "date_range"
+        format: "text"
+        goal: "track"
+      - label: "Dimensions Available"
+        column_hint: "dimension_count"
+        format: "number"
+        goal: "track"
+      - label: "Anomalies Detected"
+        column_hint: "anomalies"
+        format: "number"
+        goal: "minimize"
+    dashboard_layers:
+      - id: "full_analysis"
+        label: "Full Data Analysis"
+        icon: "🔬"
+        charts:
+          - type: "heatmap"
+            title: "Channel x Segment Matrix"
+            query_type: "by_dimensions"
+            dimension: "Channel_Segment"
+          - type: "line"
+            title: "All Metrics Trend"
+            query_type: "trend"
+            metric: "all"
+          - type: "stacked_bar"
+            title: "Dimensional Breakdown"
+            query_type: "by_dimensions"
+            dimension: "all"
+          - type: "scatter"
+            title: "Anomaly Detection"
+            query_type: "trend"
+            metric: "anomaly"
+    story_prompt: "Focus on data patterns: dimensional breakdown across all available columns, trend anomalies, cross-segment correlations, and statistical outliers in the data."
+    question_style: "exploratory"
+    suggested_questions:
+      - "Show full dimensional breakdown for May 2026 — all segments and channels"
+      - "What anomalies exist in the subscriber data for Q2 2026?"
+      - "Show heatmap of subscribers by channel and customer type"
+      - "What is the correlation between channel type and subscriber churn?"
+      - "Show all available metrics in a trend chart for 6 months"

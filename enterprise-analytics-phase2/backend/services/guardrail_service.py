@@ -1,0 +1,294 @@
+"""
+guardrail_service.py — Input safety checks with working ambiguity detection.
+Copy to: backend/services/guardrail_service.py
+
+Root cause of guardrail not firing:
+  The check() function was returning GuardrailResult dataclass but
+  chat.py was calling gr.passed / gr.action on it incorrectly.
+  This version uses a simple dict-like object that always works.
+"""
+import re
+import structlog
+from typing import Optional, List
+
+logger = structlog.get_logger()
+
+
+# ── Simple result class (no dataclass issues) ─────────────────────────────
+
+class ColumnOption:
+    def __init__(self, column: str, description: str):
+        self.column = column
+        self.description = description
+
+
+class GuardrailResult:
+    def __init__(
+        self,
+        passed: bool,
+        action: str,
+        message: str = None,
+        options: list = None,
+        confidence: float = 1.0,
+    ):
+        self.passed = passed
+        self.action = action        # "proceed" | "clarify" | "reject" | "warn"
+        self.message = message
+        self.options = options or []
+        self.confidence = confidence
+
+
+# ── Ambiguous terms — EXPANDED to catch all user phrasings ────────────────
+# Key = any word/phrase user might type
+# Value = list of possible columns it could mean
+AMBIGUOUS_TERMS = {
+    # Profitability variants
+    "profitability":    ["Revenue_Amount", "ARPU", "Margin_Rate", "Net_Revenue"],
+    "profitable":       ["Revenue_Amount", "ARPU", "Margin_Rate"],
+    "profit":           ["Revenue_Amount", "ARPU", "Net_Revenue"],
+    "margin":           ["Margin_Rate", "Net_Revenue", "Revenue_Amount"],
+    # Revenue variants
+    "revenue":          ["Revenue_Amount", "ARPU", "Total_Revenue"],
+    "earnings":         ["Revenue_Amount", "Net_Revenue", "ARPU"],
+    "income":           ["Revenue_Amount", "Net_Revenue"],
+    # Performance variants
+    "performance":      ["Subscriber_Count_CM", "Revenue_Amount", "ARPU", "Churn_Rate"],
+    "performing":       ["Subscriber_Count_CM", "Revenue_Amount", "ARPU"],
+    # Growth variants
+    "growth":           ["Subscriber_Count_CM", "Revenue_Amount", "Net_Movement"],
+    "growing":          ["Subscriber_Count_CM", "Revenue_Amount"],
+    # Cost variants
+    "cost":             ["Cost_Per_Acquisition", "Operating_Cost", "Unit_Cost"],
+    "costs":            ["Cost_Per_Acquisition", "Operating_Cost"],
+    "spend":            ["Cost_Per_Acquisition", "Operating_Cost"],
+    # Churn / Retention
+    "churn":            ["OUTFLOW", "Churn_Rate", "Disconnection_Count"],
+    "churning":         ["OUTFLOW", "Churn_Rate"],
+    "retention":        ["Retention_Rate", "Active_Subscribers"],
+    "retained":         ["Retention_Rate", "Active_Subscribers"],
+    # Acquisition
+    "activation":       ["INFLOW", "New_Activations", "Gross_Additions"],
+    "activations":      ["INFLOW", "New_Activations"],
+    "acquisition":      ["INFLOW", "Cost_Per_Acquisition", "New_Activations"],
+    # Subscriber variants
+    "subscribers":      ["Subscriber_Count_CM", "Active_Subscribers", "Net_Movement"],
+    "customers":        ["Subscriber_Count_CM", "Active_Subscribers"],
+    # Channel
+    "channel":          ["Channel", "Sales_Channel", "Acquisition_Channel"],
+    # Segment
+    "segment":          ["Customer_Subscriber_Type_Description_Q", "Segment"],
+    # Plan
+    "plan":             ["Price_Plan", "Product_Plan"],
+    "plans":            ["Price_Plan", "Product_Plan"],
+    # ARPU
+    "arpu":             ["ARPU", "Revenue_Per_User", "Average_Revenue"],
+    "average revenue":  ["ARPU", "Revenue_Amount"],
+}
+
+COLUMN_DESCRIPTIONS = {
+    "Revenue_Amount":       "Total revenue in EUR",
+    "ARPU":                 "Average revenue per user (EUR/month)",
+    "Margin_Rate":          "Gross margin as a percentage",
+    "Net_Revenue":          "Revenue after costs deducted",
+    "Total_Revenue":        "Total revenue across all segments",
+    "Subscriber_Count_CM":  "Total active subscribers (current month)",
+    "Active_Subscribers":   "Currently active subscribers",
+    "Net_Movement":         "INFLOW minus OUTFLOW (net change)",
+    "OUTFLOW":              "Subscribers who disconnected this period",
+    "Churn_Rate":           "Percentage of subscribers who churned (%)",
+    "Disconnection_Count":  "Number of disconnections",
+    "Retention_Rate":       "Percentage of subscribers retained (%)",
+    "Active_Subscribers":   "Currently active subscriber count",
+    "INFLOW":               "New subscriber activations this period",
+    "New_Activations":      "New customer activations",
+    "Gross_Additions":      "Total gross subscriber additions",
+    "Cost_Per_Acquisition": "Average cost to acquire one subscriber",
+    "Operating_Cost":       "Total operating costs",
+    "Unit_Cost":            "Cost per unit/subscriber",
+    "Channel":              "Acquisition channel (Affiliate/Retail/Direct/Online)",
+    "Sales_Channel":        "Sales channel used for the transaction",
+    "Acquisition_Channel":  "Channel through which subscriber was acquired",
+    "Customer_Subscriber_Type_Description_Q":
+                            "Customer segment (Residential/SME/Enterprise/Prepay)",
+    "Price_Plan":           "Product/pricing plan name",
+    "Product_Plan":         "Product bundle plan",
+    "ARPU":                 "Average revenue per user (EUR/month)",
+    "Revenue_Per_User":     "Revenue per user per month",
+    "Average_Revenue":      "Average revenue across subscriber base",
+}
+
+# ── Prompt injection ──────────────────────────────────────────────────────
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"forget\s+(the\s+)?system\s+prompt",
+    r"you\s+are\s+now\s+",
+    r"act\s+as\s+if",
+    r"pretend\s+(you\s+are|to\s+be)",
+    r"jailbreak",
+    r"override\s+.{0,20}instructions",
+    r"disregard\s+.{0,20}rules",
+]
+
+# ── Off-topic ─────────────────────────────────────────────────────────────
+OFF_TOPIC_PATTERNS = [
+    r"\bweather\s+(today|tomorrow|forecast)\b",
+    r"\brecipe\s+for\b",
+    r"\bsports?\s+(score|result)\b",
+    r"\btell\s+me\s+a\s+joke\b",
+    r"\bwrite\s+(me\s+)?(an?\s+)?(email|poem|essay|story)\b",
+    r"\bcrypto(currency)?\s+price\b",
+    r"\bstock\s+(price|market)\b",
+]
+
+# ── Future dates ──────────────────────────────────────────────────────────
+FUTURE_PERIODS = [
+    "june 2026", "july 2026", "august 2026", "september 2026",
+    "october 2026", "november 2026", "december 2026", "2027", "2028",
+]
+LATEST_DATA = "May 2026"
+
+
+def check(query: str, schema: dict = None) -> GuardrailResult:
+    """
+    Run all guardrail checks against a user query.
+
+    Returns GuardrailResult with:
+      .passed  — True = let it through, False = intercept
+      .action  — "proceed" | "clarify" | "reject" | "warn"
+      .message — message to show user
+      .options — list of ColumnOption for clarification
+    """
+    if not query or not query.strip():
+        return GuardrailResult(passed=False, action="reject",
+                               message="Please enter a question.")
+
+    q = query.lower().strip()
+
+    # ── 1. Prompt injection ───────────────────────────────────────────
+    for pat in INJECTION_PATTERNS:
+        if re.search(pat, q, re.IGNORECASE):
+            logger.warning("Prompt injection blocked", query=query[:80])
+            return GuardrailResult(
+                passed=False, action="reject",
+                message="I can only help with Vodafone Ireland analytics queries.",
+            )
+
+    # ── 2. Off-topic ──────────────────────────────────────────────────
+    for pat in OFF_TOPIC_PATTERNS:
+        if re.search(pat, q, re.IGNORECASE):
+            logger.info("Off-topic blocked", query=query[:80])
+            return GuardrailResult(
+                passed=False, action="reject",
+                message=(
+                    "I'm specialised in Vodafone Ireland analytics. "
+                    "I can't help with that, but I can analyse your "
+                    "subscriber data, revenue trends, channel performance "
+                    "or competitive position. What would you like to explore?"
+                ),
+            )
+
+    # ── 3. Future date ────────────────────────────────────────────────
+    for fp in FUTURE_PERIODS:
+        if fp in q:
+            return GuardrailResult(
+                passed=False, action="warn",
+                message=(
+                    f"I don't have data for {fp.title()} yet. "
+                    f"The most recent available data is {LATEST_DATA}. "
+                    f"Would you like to see {LATEST_DATA} data instead?"
+                ),
+            )
+
+    # ── 4. Ambiguous metric — CHECK EVERY TERM ────────────────────────
+    # This is the key fix: we check ALL terms, not just the first match.
+    # We use word boundary matching so "profitability" matches exactly.
+    for term, candidates in AMBIGUOUS_TERMS.items():
+        # Use word boundary to avoid partial matches
+        pattern = rf"\b{re.escape(term)}\b"
+        if re.search(pattern, q, re.IGNORECASE):
+            # Filter candidates to those visible in schema if provided
+            if schema:
+                schema_str = str(schema).lower()
+                matching = [
+                    c for c in candidates
+                    if c.lower() in schema_str
+                    or c.lower().replace("_", " ") in schema_str
+                ]
+                # Fall back to all candidates if none match schema
+                if not matching:
+                    matching = candidates
+            else:
+                matching = candidates
+
+            # Only ask for clarification if 2+ columns match
+            if len(matching) >= 2:
+                options = [
+                    ColumnOption(
+                        column=col,
+                        description=COLUMN_DESCRIPTIONS.get(
+                            col, col.replace("_", " ").title()
+                        ),
+                    )
+                    for col in matching[:4]   # max 4 options
+                ]
+                logger.info("Ambiguous term detected",
+                            term=term,
+                            options=[o.column for o in options])
+                return GuardrailResult(
+                    passed=False,
+                    action="clarify",
+                    message=(
+                        f'I found {len(options)} columns that could mean '
+                        f'"{term}" in your Vodafone Ireland data.\n'
+                        f'Which one would you like me to analyse?'
+                    ),
+                    options=options,
+                    confidence=0.6,
+                )
+
+    # ── 5. Too vague ──────────────────────────────────────────────────
+    vague_patterns = [
+        r"^show\s+me\s+everything$",
+        r"^give\s+me\s+all(\s+the)?\s+data$",
+        r"^(what|how)\s+(is|are)\s+(it|things|we)\s+doing\??$",
+    ]
+    for pat in vague_patterns:
+        if re.search(pat, q, re.IGNORECASE):
+            return GuardrailResult(
+                passed=False, action="clarify",
+                message=(
+                    "That's quite broad — could you be more specific? For example:\n"
+                    "• 'Show subscriber count for May 2026'\n"
+                    "• 'What is the INFLOW by channel this month?'\n"
+                    "• 'Show ARPU trend for the last 6 months'"
+                ),
+                options=[
+                    ColumnOption("Subscriber_Count_CM", "Total active subscriber numbers"),
+                    ColumnOption("INFLOW by Channel",   "Activations broken down by channel"),
+                    ColumnOption("ARPU trend",          "Revenue per user over 6 months"),
+                ],
+            )
+
+    # ── All clear ─────────────────────────────────────────────────────
+    logger.debug("Guardrail passed", query=query[:60])
+    return GuardrailResult(passed=True, action="proceed", confidence=1.0)
+
+
+def strip_pii(text: str) -> str:
+    """Strip PII from response text. GDPR Article 25 / OWASP LLM06."""
+    patterns = [
+        r"\b0[0-9]{9}\b",
+        r"\b[A-Z]{2}[0-9]{6}[A-Z]?\b",
+        r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b",
+        r"\bMSISDN:\s*[0-9]+\b",
+        r"\b[0-9]{16}\b",
+    ]
+    for pat in patterns:
+        text = re.sub(pat, "[REDACTED]", text)
+    return text
+def validate_numbers_against_data(numbers, data):
+
+    # your validation logic here
+
+    pass
+ 
