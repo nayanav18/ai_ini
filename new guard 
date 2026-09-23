@@ -1,0 +1,902 @@
+"""
+guardrail_service.py
+
+Input safety, metric resolution, ambiguity detection and PII protection.
+
+Important behavior:
+- Explicit metric phrases are resolved before generic ambiguity detection.
+- "total revenue" -> Total_Revenue
+- "revenue amount" -> Revenue_Amount
+- "net revenue" -> Net_Revenue
+- "arpu" / "average revenue per user" -> ARPU
+- Generic "revenue" remains ambiguous when multiple revenue fields exist.
+"""
+
+import re
+import structlog
+
+logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Result objects
+# ---------------------------------------------------------------------------
+
+class ColumnOption:
+    def __init__(self, column: str, description: str):
+        self.column = column
+        self.description = description
+
+
+class GuardrailResult:
+    def __init__(
+        self,
+        passed: bool,
+        action: str,
+        message: str = None,
+        options: list = None,
+        confidence: float = 1.0,
+    ):
+        self.passed = passed
+        self.action = action
+        self.message = message
+        self.options = options or []
+        self.confidence = confidence
+
+
+# ---------------------------------------------------------------------------
+# Explicit metric phrases
+#
+# IMPORTANT:
+# These are checked BEFORE AMBIGUOUS_TERMS.
+#
+# Example:
+# "What is total revenue?"
+#
+# must resolve to:
+# Total_Revenue
+#
+# rather than matching the generic word:
+# revenue
+# ---------------------------------------------------------------------------
+
+EXPLICIT_METRIC_PHRASES = {
+    # Revenue
+    "total revenue": "Total_Revenue",
+    "total revenues": "Total_Revenue",
+    "revenue amount": "Revenue_Amount",
+    "revenue amounts": "Revenue_Amount",
+    "net revenue": "Net_Revenue",
+
+    # ARPU
+    "average revenue per user": "ARPU",
+    "average revenue per subscriber": "ARPU",
+    "revenue per user": "ARPU",
+    "revenue per subscriber": "ARPU",
+
+    # Margin
+    "margin rate": "Margin_Rate",
+    "gross margin": "Margin_Rate",
+
+    # Subscribers
+    "subscriber count": "Subscriber_Count_CM",
+    "subscriber count cm": "Subscriber_Count_CM",
+    "active subscribers": "Active_Subscribers",
+
+    # Churn
+    "churn rate": "Churn_Rate",
+    "disconnection count": "Disconnection_Count",
+
+    # Retention
+    "retention rate": "Retention_Rate",
+
+    # Acquisition
+    "cost per acquisition": "Cost_Per_Acquisition",
+    "new activations": "New_Activations",
+    "gross additions": "Gross_Additions",
+
+    # Costs
+    "operating cost": "Operating_Cost",
+    "operating costs": "Operating_Cost",
+    "unit cost": "Unit_Cost",
+
+    # Movement
+    "net movement": "Net_Movement",
+}
+
+
+# ---------------------------------------------------------------------------
+# Generic ambiguous terms
+# ---------------------------------------------------------------------------
+
+AMBIGUOUS_TERMS = {
+    # Profitability variants
+    "profitability": [
+        "Revenue_Amount",
+        "ARPU",
+        "Margin_Rate",
+        "Net_Revenue",
+    ],
+
+    "profitable": [
+        "Revenue_Amount",
+        "ARPU",
+        "Margin_Rate",
+    ],
+
+    "profit": [
+        "Revenue_Amount",
+        "ARPU",
+        "Net_Revenue",
+    ],
+
+    "margin": [
+        "Margin_Rate",
+        "Net_Revenue",
+        "Revenue_Amount",
+    ],
+
+    # Revenue variants
+    "revenue": [
+        "Revenue_Amount",
+        "ARPU",
+        "Total_Revenue",
+    ],
+
+    "earnings": [
+        "Revenue_Amount",
+        "Net_Revenue",
+        "ARPU",
+    ],
+
+    "income": [
+        "Revenue_Amount",
+        "Net_Revenue",
+    ],
+
+    # Performance
+    "performance": [
+        "Subscriber_Count_CM",
+        "Revenue_Amount",
+        "ARPU",
+        "Churn_Rate",
+    ],
+
+    "performing": [
+        "Subscriber_Count_CM",
+        "Revenue_Amount",
+        "ARPU",
+    ],
+
+    # Growth
+    "growth": [
+        "Subscriber_Count_CM",
+        "Revenue_Amount",
+        "Net_Movement",
+    ],
+
+    "growing": [
+        "Subscriber_Count_CM",
+        "Revenue_Amount",
+    ],
+
+    # Cost
+    "cost": [
+        "Cost_Per_Acquisition",
+        "Operating_Cost",
+        "Unit_Cost",
+    ],
+
+    "costs": [
+        "Cost_Per_Acquisition",
+        "Operating_Cost",
+    ],
+
+    "spend": [
+        "Cost_Per_Acquisition",
+        "Operating_Cost",
+    ],
+
+    # Churn / retention
+    "churn": [
+        "OUTFLOW",
+        "Churn_Rate",
+        "Disconnection_Count",
+    ],
+
+    "churning": [
+        "OUTFLOW",
+        "Churn_Rate",
+    ],
+
+    "retention": [
+        "Retention_Rate",
+        "Active_Subscribers",
+    ],
+
+    "retained": [
+        "Retention_Rate",
+        "Active_Subscribers",
+    ],
+
+    # Acquisition
+    "activation": [
+        "INFLOW",
+        "New_Activations",
+        "Gross_Additions",
+    ],
+
+    "activations": [
+        "INFLOW",
+        "New_Activations",
+    ],
+
+    "acquisition": [
+        "INFLOW",
+        "Cost_Per_Acquisition",
+        "New_Activations",
+    ],
+
+    # Subscribers
+    "subscribers": [
+        "Subscriber_Count_CM",
+        "Active_Subscribers",
+        "Net_Movement",
+    ],
+
+    "customers": [
+        "Subscriber_Count_CM",
+        "Active_Subscribers",
+    ],
+
+    # Channel
+    "channel": [
+        "Channel",
+        "Sales_Channel",
+        "Acquisition_Channel",
+    ],
+
+    # Segment
+    "segment": [
+        "Customer_Subscriber_Type_Description_Q",
+        "Segment",
+    ],
+
+    # Plan
+    "plan": [
+        "Price_Plan",
+        "Product_Plan",
+    ],
+
+    "plans": [
+        "Price_Plan",
+        "Product_Plan",
+    ],
+
+    # ARPU
+    "arpu": [
+        "ARPU",
+        "Revenue_Per_User",
+        "Average_Revenue",
+    ],
+
+    "average revenue": [
+        "ARPU",
+        "Revenue_Amount",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Column descriptions
+# ---------------------------------------------------------------------------
+
+COLUMN_DESCRIPTIONS = {
+    "Revenue_Amount":
+        "Total revenue in EUR",
+
+    "ARPU":
+        "Average revenue per user (EUR/month)",
+
+    "Margin_Rate":
+        "Gross margin as a percentage",
+
+    "Net_Revenue":
+        "Revenue after costs deducted",
+
+    "Total_Revenue":
+        "Total revenue across all segments",
+
+    "Subscriber_Count_CM":
+        "Total active subscribers (current month)",
+
+    "Active_Subscribers":
+        "Currently active subscribers",
+
+    "Net_Movement":
+        "INFLOW minus OUTFLOW (net change)",
+
+    "OUTFLOW":
+        "Subscribers who disconnected this period",
+
+    "Churn_Rate":
+        "Percentage of subscribers who churned (%)",
+
+    "Disconnection_Count":
+        "Number of disconnections",
+
+    "Retention_Rate":
+        "Percentage of subscribers retained (%)",
+
+    "INFLOW":
+        "New subscriber activations this period",
+
+    "New_Activations":
+        "New customer activations",
+
+    "Gross_Additions":
+        "Total gross subscriber additions",
+
+    "Cost_Per_Acquisition":
+        "Average cost to acquire one subscriber",
+
+    "Operating_Cost":
+        "Total operating costs",
+
+    "Unit_Cost":
+        "Cost per unit/subscriber",
+
+    "Channel":
+        "Acquisition channel (Affiliate/Retail/Direct/Online)",
+
+    "Sales_Channel":
+        "Sales channel used for the transaction",
+
+    "Acquisition_Channel":
+        "Channel through which subscriber was acquired",
+
+    "Customer_Subscriber_Type_Description_Q":
+        "Customer segment (Residential/SME/Enterprise/Prepay)",
+
+    "Price_Plan":
+        "Product/pricing plan name",
+
+    "Product_Plan":
+        "Product bundle plan",
+
+    "Revenue_Per_User":
+        "Revenue per user per month",
+
+    "Average_Revenue":
+        "Average revenue across subscriber base",
+}
+
+
+# ---------------------------------------------------------------------------
+# Prompt injection protection
+# ---------------------------------------------------------------------------
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"forget\s+(the\s+)?system\s+prompt",
+    r"you\s+are\s+now\s+",
+    r"act\s+as\s+if",
+    r"pretend\s+(you\s+are|to\s+be)",
+    r"jailbreak",
+    r"override\s+.{0,20}instructions",
+    r"disregard\s+.{0,20}rules",
+]
+
+
+# ---------------------------------------------------------------------------
+# Off-topic protection
+# ---------------------------------------------------------------------------
+
+OFF_TOPIC_PATTERNS = [
+    r"\bweather\s+(today|tomorrow|forecast)\b",
+    r"\brecipe\s+for\b",
+    r"\bsports?\s+(score|result)\b",
+    r"\btell\s+me\s+a\s+joke\b",
+    r"\bwrite\s+(me\s+)?(an?\s+)?(email|poem|essay|story)\b",
+    r"\bcrypto(currency)?\s+price\b",
+    r"\bstock\s+(price|market)\b",
+]
+
+
+# ---------------------------------------------------------------------------
+# Future dates
+# ---------------------------------------------------------------------------
+
+FUTURE_PERIODS = [
+    "june 2026",
+    "july 2026",
+    "august 2026",
+    "september 2026",
+    "october 2026",
+    "november 2026",
+    "december 2026",
+    "2027",
+    "2028",
+]
+
+LATEST_DATA = "May 2026"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _schema_contains_column(
+    schema: dict,
+    column: str,
+) -> bool:
+    """
+    Check whether a column exists in discovered metadata.
+
+    Supports the current metadata structure:
+        schema["tables"][table]["columns"]
+    """
+
+    if not schema:
+        return False
+
+    target = column.lower()
+
+    # Direct string representation fallback.
+    schema_string = str(schema).lower()
+
+    if target in schema_string:
+        return True
+
+    # Explicit table/column traversal.
+    tables = schema.get("tables", {})
+
+    if not isinstance(tables, dict):
+        return False
+
+    for table_info in tables.values():
+
+        if not isinstance(table_info, dict):
+            continue
+
+        columns = table_info.get("columns", [])
+
+        if not isinstance(columns, list):
+            continue
+
+        for field in columns:
+
+            if isinstance(field, dict):
+                name = str(
+                    field.get("name", "")
+                ).lower()
+
+                if name == target:
+                    return True
+
+            elif str(field).lower() == target:
+                return True
+
+    return False
+
+
+def _resolve_explicit_metric(
+    query: str,
+    schema: dict = None,
+):
+    """
+    Resolve explicit natural-language metric phrases.
+
+    Returns:
+        column name if explicitly resolved
+        None otherwise
+    """
+
+    q = query.lower().strip()
+
+    # Longest phrases first.
+    phrases = sorted(
+        EXPLICIT_METRIC_PHRASES.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    for phrase, column in phrases:
+
+        pattern = rf"\b{re.escape(phrase)}\b"
+
+        if not re.search(
+            pattern,
+            q,
+            re.IGNORECASE,
+        ):
+            continue
+
+        # If schema is available and the requested column definitely
+        # exists, resolve it.
+        if schema:
+
+            if _schema_contains_column(
+                schema,
+                column,
+            ):
+                return column
+
+            # The phrase is explicit, but the discovered schema does
+            # not contain that exact field. Do not falsely claim that
+            # it exists.
+            logger.warning(
+                "Explicit metric not found in schema",
+                phrase=phrase,
+                expected_column=column,
+            )
+
+            continue
+
+        # If metadata is not available yet, allow the explicit
+        # semantic resolution to continue downstream.
+        return column
+
+    return None
+
+
+def _column_options(
+    candidates: list,
+    schema: dict = None,
+) -> list:
+    """
+    Filter candidate columns against schema where possible.
+    """
+
+    matching = []
+
+    for candidate in candidates:
+
+        if schema:
+
+            if _schema_contains_column(
+                schema,
+                candidate,
+            ):
+                matching.append(candidate)
+
+        else:
+            matching.append(candidate)
+
+    # If schema filtering removed everything, preserve the original
+    # candidates. This keeps guardrail behavior compatible with the
+    # existing pipeline when schema isn't available at this stage.
+    if not matching:
+        matching = candidates
+
+    return [
+        ColumnOption(
+            column=column,
+            description=COLUMN_DESCRIPTIONS.get(
+                column,
+                column.replace("_", " ").title(),
+            ),
+        )
+        for column in matching[:4]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Main guardrail
+# ---------------------------------------------------------------------------
+
+def check(
+    query: str,
+    schema: dict = None,
+) -> GuardrailResult:
+    """
+    Run all guardrail checks against a user query.
+
+    Returns GuardrailResult:
+
+        .passed
+            True  -> continue pipeline
+            False -> intercept
+
+        .action
+            proceed | clarify | reject | warn
+
+        .message
+            User-facing message
+
+        .options
+            ColumnOption objects for clarification
+
+        .confidence
+            Resolution confidence
+    """
+
+    # ------------------------------------------------------------------
+    # Empty query
+    # ------------------------------------------------------------------
+
+    if not query or not query.strip():
+
+        return GuardrailResult(
+            passed=False,
+            action="reject",
+            message="Please enter a question.",
+        )
+
+    q = query.lower().strip()
+
+    # ------------------------------------------------------------------
+    # 1. Prompt injection
+    # ------------------------------------------------------------------
+
+    for pattern in INJECTION_PATTERNS:
+
+        if re.search(
+            pattern,
+            q,
+            re.IGNORECASE,
+        ):
+
+            logger.warning(
+                "Prompt injection blocked",
+                query=query[:80],
+            )
+
+            return GuardrailResult(
+                passed=False,
+                action="reject",
+                message=(
+                    "I can only help with Vodafone Ireland "
+                    "analytics queries."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Off-topic
+    # ------------------------------------------------------------------
+
+    for pattern in OFF_TOPIC_PATTERNS:
+
+        if re.search(
+            pattern,
+            q,
+            re.IGNORECASE,
+        ):
+
+            logger.info(
+                "Off-topic blocked",
+                query=query[:80],
+            )
+
+            return GuardrailResult(
+                passed=False,
+                action="reject",
+                message=(
+                    "I'm specialised in Vodafone Ireland analytics. "
+                    "I can't help with that, but I can analyse your "
+                    "subscriber data, revenue trends, channel "
+                    "performance or competitive position. "
+                    "What would you like to explore?"
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # 3. Future date
+    # ------------------------------------------------------------------
+
+    for future_period in FUTURE_PERIODS:
+
+        if future_period in q:
+
+            return GuardrailResult(
+                passed=False,
+                action="warn",
+                message=(
+                    f"I don't have data for "
+                    f"{future_period.title()} yet. "
+                    f"The most recent available data is "
+                    f"{LATEST_DATA}. "
+                    f"Would you like to see {LATEST_DATA} data instead?"
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # 4. EXPLICIT METRIC RESOLUTION
+    #
+    # This MUST happen before generic ambiguity detection.
+    #
+    # Example:
+    #
+    # "What is total revenue?"
+    #
+    # matches:
+    # total revenue -> Total_Revenue
+    #
+    # and therefore MUST NOT fall through to:
+    # revenue -> Revenue_Amount / ARPU / Total_Revenue
+    # ------------------------------------------------------------------
+
+    explicit_column = _resolve_explicit_metric(
+        query,
+        schema,
+    )
+
+    if explicit_column:
+
+        logger.info(
+            "Explicit metric resolved",
+            query=query[:100],
+            metric=explicit_column,
+        )
+
+        return GuardrailResult(
+            passed=True,
+            action="proceed",
+            confidence=0.98,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Generic ambiguous metric detection
+    # ------------------------------------------------------------------
+
+    for term, candidates in AMBIGUOUS_TERMS.items():
+
+        pattern = rf"\b{re.escape(term)}\b"
+
+        if not re.search(
+            pattern,
+            q,
+            re.IGNORECASE,
+        ):
+            continue
+
+        options = _column_options(
+            candidates,
+            schema,
+        )
+
+        # Only clarify if there are genuinely multiple possible
+        # meanings.
+        if len(options) >= 2:
+
+            logger.info(
+                "Ambiguous term detected",
+                term=term,
+                options=[
+                    option.column
+                    for option in options
+                ],
+            )
+
+            return GuardrailResult(
+                passed=False,
+                action="clarify",
+                message=(
+                    f'I found {len(options)} columns that could '
+                    f'mean "{term}" in your Vodafone Ireland data.\n'
+                    f'Which one would you like me to analyse?'
+                ),
+                options=options,
+                confidence=0.60,
+            )
+
+    # ------------------------------------------------------------------
+    # 6. Too vague
+    # ------------------------------------------------------------------
+
+    vague_patterns = [
+        r"^show\s+me\s+everything$",
+        r"^give\s+me\s+all(\s+the)?\s+data$",
+        r"^(what|how)\s+(is|are)\s+(it|things|we)\s+doing\??$",
+    ]
+
+    for pattern in vague_patterns:
+
+        if re.search(
+            pattern,
+            q,
+            re.IGNORECASE,
+        ):
+
+            return GuardrailResult(
+                passed=False,
+                action="clarify",
+                message=(
+                    "That's quite broad — could you be more specific? "
+                    "For example:\n"
+                    "• 'Show subscriber count for May 2026'\n"
+                    "• 'What is the INFLOW by channel this month?'\n"
+                    "• 'Show ARPU trend for the last 6 months'"
+                ),
+                options=[
+                    ColumnOption(
+                        "Subscriber_Count_CM",
+                        "Total active subscriber numbers",
+                    ),
+                    ColumnOption(
+                        "INFLOW by Channel",
+                        "Activations broken down by channel",
+                    ),
+                    ColumnOption(
+                        "ARPU trend",
+                        "Revenue per user over 6 months",
+                    ),
+                ],
+            )
+
+    # ------------------------------------------------------------------
+    # 7. All clear
+    # ------------------------------------------------------------------
+
+    logger.debug(
+        "Guardrail passed",
+        query=query[:60],
+    )
+
+    return GuardrailResult(
+        passed=True,
+        action="proceed",
+        confidence=1.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PII protection
+# ---------------------------------------------------------------------------
+
+def strip_pii(text: str) -> str:
+    """
+    Strip common PII patterns from generated response text.
+    """
+
+    if not text:
+        return text
+
+    patterns = [
+        # Indian-style 10 digit mobile number
+        r"\b0[0-9]{9}\b",
+
+        # Generic ID/passport-like pattern
+        r"\b[A-Z]{2}[0-9]{6}[A-Z]?\b",
+
+        # Email
+        r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b",
+
+        # MSISDN
+        r"\bMSISDN:\s*[0-9]+\b",
+
+        # 16-digit number
+        r"\b[0-9]{16}\b",
+    ]
+
+    for pattern in patterns:
+        text = re.sub(
+            pattern,
+            "[REDACTED]",
+            text,
+        )
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Number validation
+# ---------------------------------------------------------------------------
+
+def validate_numbers_against_data(
+    result,
+    data,
+):
+    """
+    Validate generated analytics against retrieved data.
+
+    This function intentionally returns the original result for now
+    rather than silently modifying Gemini output.
+
+    The AnalyticsAgent already treats this function defensively.
+
+    A stronger numeric validation layer can be added later once the
+    exact KPI/data contract is finalized.
+    """
+
+    return result
